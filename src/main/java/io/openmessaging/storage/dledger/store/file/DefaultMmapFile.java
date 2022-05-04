@@ -33,6 +33,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 对应rocketMQ的mappedFile
+ */
 public class DefaultMmapFile extends ReferenceResource implements MmapFile {
     public static final int OS_PAGE_SIZE = 1024 * 4;
     protected static Logger logger = LoggerFactory.getLogger(DefaultMmapFile.class);
@@ -172,7 +175,7 @@ public class DefaultMmapFile extends ReferenceResource implements MmapFile {
 
     /**
      * Content of data from offset to offset + length will be wrote to file.
-     *
+     * 主要工作是将消息写入mappedByteBuffer，该对象是通过FileChannel的map()方法创建的，即日志首先写入pageCache
      * @param offset The offset of the subarray to be used.
      * @param length The length of the subarray to be used.
      */

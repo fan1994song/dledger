@@ -30,6 +30,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 对应MappedFileQueue
+ */
 public class MmapFileList {
     public static final int MIN_BLANK_LEN = 8;
     public static final int BLANK_MAGIC_CODE = -1;
@@ -189,21 +192,33 @@ public class MmapFileList {
         return preAppend(len, true);
     }
 
+    /**
+     * 预写入
+     * @param len 申请长度
+     * @param useBlank 是否需要填充，默认true
+     * @return 返回存储的起始偏移量
+     */
     public long preAppend(int len, boolean useBlank) {
+        // 获取最后一个文件
         MmapFile mappedFile = getLastMappedFile();
+        // 若为空或者已经满了，创建下一个文件，提供预写入
         if (null == mappedFile || mappedFile.isFull()) {
             mappedFile = getLastMappedFile(0);
         }
+        // 创建失败
         if (null == mappedFile) {
             logger.error("Create mapped file for {}", storePath);
             return -1;
         }
+        // 需要空余MIN_BLANK_LEN个字符
         int blank = useBlank ? MIN_BLANK_LEN : 0;
+        // 如果文件大小减去写入的位置小于单条消息，也就是说该文件已经放不下了
         if (len + blank > mappedFile.getFileSize() - mappedFile.getWrotePosition()) {
             if (blank < MIN_BLANK_LEN) {
                 logger.error("Blank {} should ge {}", blank, MIN_BLANK_LEN);
                 return -1;
             } else {
+                // 填充文件结尾魔数(BLANK_MAGIC_CODE)，标志当前文件存储满了
                 ByteBuffer byteBuffer = ByteBuffer.allocate(mappedFile.getFileSize() - mappedFile.getWrotePosition());
                 byteBuffer.putInt(BLANK_MAGIC_CODE);
                 byteBuffer.putInt(mappedFile.getFileSize() - mappedFile.getWrotePosition());
@@ -214,6 +229,7 @@ public class MmapFileList {
                     logger.error("Append blank error for {}", storePath);
                     return -1;
                 }
+                // 创建新的文件用于写入
                 mappedFile = getLastMappedFile(0);
                 if (null == mappedFile) {
                     logger.error("Create mapped file for {}", storePath);
@@ -222,9 +238,16 @@ public class MmapFileList {
             }
         }
         return mappedFile.getFileFromOffset() + mappedFile.getWrotePosition();
-
     }
 
+    /**
+     * 将消息写入pageCache
+     * @param data
+     * @param pos
+     * @param len
+     * @param useBlank
+     * @return
+     */
     public long append(byte[] data, int pos, int len, boolean useBlank) {
         if (preAppend(len, useBlank) == -1) {
             return -1;

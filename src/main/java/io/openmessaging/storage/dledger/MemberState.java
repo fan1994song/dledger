@@ -32,6 +32,9 @@ import static io.openmessaging.storage.dledger.MemberState.Role.CANDIDATE;
 import static io.openmessaging.storage.dledger.MemberState.Role.FOLLOWER;
 import static io.openmessaging.storage.dledger.MemberState.Role.LEADER;
 
+/**
+ * 节点状态机
+ */
 public class MemberState {
 
     public static final String TERM_PERSIST_FILE = "currterm";
@@ -45,11 +48,13 @@ public class MemberState {
     private final String peers;
     private volatile Role role = CANDIDATE;
     private volatile String leaderId;
+    // 应该是版本号的概念
     private volatile long currTerm = 0;
     private volatile String currVoteFor;
     private volatile long ledgerEndIndex = -1;
     private volatile long ledgerEndTerm = -1;
     private long knownMaxTermInGroup = -1;
+    // 读取DLedgerConfig配置的实例信息
     private Map<String, String> peerMap = new HashMap<>();
     private Map<String, Boolean> peersLiveTable = new ConcurrentHashMap<>();
 

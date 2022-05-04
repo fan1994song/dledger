@@ -60,6 +60,9 @@ import java.util.concurrent.CompletableFuture;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 基于Raft协议的集群内节点的封装类
+ */
 public class DLedgerServer implements DLedgerProtocolHandler {
 
     private static Logger logger = LoggerFactory.getLogger(DLedgerServer.class);
@@ -169,6 +172,11 @@ public class DLedgerServer implements DLedgerProtocolHandler {
      * 2.submit the future to entry pusher and wait the quorum ack
      * 3.if the pending requests are full, then reject it immediately
      *
+     * 处理追加请求：
+     * 1.将条目追加到本地存储
+     * 2.提交未来到条目推送器并等待 quorum ack
+     * 3.如果挂起的请求已满，则立即拒绝它
+     *
      * @param request
      * @return
      * @throws IOException
@@ -176,12 +184,16 @@ public class DLedgerServer implements DLedgerProtocolHandler {
     @Override
     public CompletableFuture<AppendEntryResponse> handleAppend(AppendEntryRequest request) throws IOException {
         try {
+            // 基础校验
             PreConditions.check(memberState.getSelfId().equals(request.getRemoteId()), DLedgerResponseCode.UNKNOWN_MEMBER, "%s != %s", request.getRemoteId(), memberState.getSelfId());
             PreConditions.check(memberState.getGroup().equals(request.getGroup()), DLedgerResponseCode.UNKNOWN_GROUP, "%s != %s", request.getGroup(), memberState.getGroup());
             PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER);
             PreConditions.check(memberState.getTransferee() == null, DLedgerResponseCode.LEADER_TRANSFERRING);
+
             long currTerm = memberState.currTerm();
+            // 消息追加是异步过程，内容暂存到内存队列中，此处检查内存队列是否已满，队列大小默认不能超过10000条
             if (dLedgerEntryPusher.isPendingFull(currTerm)) {
+                // 如果内存队列已满，拒绝追加请求
                 AppendEntryResponse appendEntryResponse = new AppendEntryResponse();
                 appendEntryResponse.setGroup(memberState.getGroup());
                 appendEntryResponse.setCode(DLedgerResponseCode.LEADER_PENDING_FULL.getCode());
@@ -204,6 +216,7 @@ public class DLedgerServer implements DLedgerProtocolHandler {
                             resEntry = dLedgerStore.appendAsLeader(dLedgerEntry);
                             positions[index++] = resEntry.getPos();
                         }
+                        // 批量只等待最后一条ACK
                         // only wait last entry ack is ok
                         BatchAppendFuture<AppendEntryResponse> batchAppendFuture =
                             (BatchAppendFuture<AppendEntryResponse>) dLedgerEntryPusher.waitAck(resEntry, true);
@@ -213,9 +226,12 @@ public class DLedgerServer implements DLedgerProtocolHandler {
                     throw new DLedgerException(DLedgerResponseCode.REQUEST_WITH_EMPTY_BODYS, "BatchAppendEntryRequest" +
                         " with empty bodys");
                 } else {
+                    // 若是单条消息，追加到leader节点的pageCache中
                     DLedgerEntry dLedgerEntry = new DLedgerEntry();
                     dLedgerEntry.setBody(request.getBody());
+                    // Leader节点日志存储
                     DLedgerEntry resEntry = dLedgerStore.appendAsLeader(dLedgerEntry);
+                    // Leader节点等待从节点日志复制响应ACK
                     return dLedgerEntryPusher.waitAck(resEntry, false);
                 }
             }

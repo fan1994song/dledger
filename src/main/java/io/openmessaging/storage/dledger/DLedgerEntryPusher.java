@@ -47,24 +47,34 @@ import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 日志转发与处理核心类
+ */
 public class DLedgerEntryPusher {
 
     private static Logger logger = LoggerFactory.getLogger(DLedgerEntryPusher.class);
 
+    // DLedger多副本相关配置
     private DLedgerConfig dLedgerConfig;
+    // 存储实现类
     private DLedgerStore dLedgerStore;
-
+    // 节点状态机
     private final MemberState memberState;
-
+    // RPC服务实现类
     private DLedgerRpcService dLedgerRpcService;
 
-    private Map<Long, ConcurrentMap<String, Long>> peerWaterMarksByTerm = new ConcurrentHashMap<>();
+    // 主要作用是判断已提交日志的序号，该数据结构用于计算一条日志是否已被超过半数的节点存储
+    private Map<Long/*team，投票轮次*/, ConcurrentMap<String/*节点编号*/, Long/*日志序号*/>> peerWaterMarksByTerm = new ConcurrentHashMap<>();
+    // 用于存放日志追加请求的响应结果 (Future模式)
     private Map<Long, ConcurrentMap<Long, TimeoutFuture<AppendEntryResponse>>> pendingAppendResponsesByTerm = new ConcurrentHashMap<>();
 
+    // 从节点上开启的线程，用于接收主节点的推送请求
     private EntryHandler entryHandler;
 
+    // 主节点上的日志复制 结果仲裁器，用于判断日志是否可提交
     private QuorumAckChecker quorumAckChecker;
 
+    // 日志请求转 发器，负责向从节点转发日志，主节点为每一个从节点构建一个 EntryDispatcher
     private Map<String, EntryDispatcher> dispatcherMap = new HashMap<>();
 
     private Optional<StateMachineCaller> fsmCaller;
@@ -75,6 +85,7 @@ public class DLedgerEntryPusher {
         this.memberState = memberState;
         this.dLedgerStore = dLedgerStore;
         this.dLedgerRpcService = dLedgerRpcService;
+        // 每一个从节点创建一个EntryDispatcher转发线程，即每一个从节点的日志转发相互不干扰
         for (String peer : memberState.getPeerMap().keySet()) {
             if (!peer.equals(memberState.getSelfId())) {
                 dispatcherMap.put(peer, new EntryDispatcher(peer, logger));
@@ -85,7 +96,17 @@ public class DLedgerEntryPusher {
         this.fsmCaller = Optional.empty();
     }
 
+    /**
+     * 开启日志推送的startup方法
+     */
     public void startup() {
+        /**
+         * 日志复制核心流程
+         * 1)Leader节点将日志推送到从节点。
+         * 2)从节点收到Leader节点推送的日志并存储，然后向Leader节点 汇报日志复制结果。
+         * 3)Leader节点对日志复制进行仲裁，如果成功存储该条日志的节点超过半数节点，则向客户端返回写入成功。
+         */
+        // 线程启动
         entryHandler.start();
         quorumAckChecker.start();
         for (EntryDispatcher dispatcher : dispatcherMap.values()) {
@@ -148,9 +169,17 @@ public class DLedgerEntryPusher {
         return pendingAppendResponsesByTerm.get(currTerm).size() > dLedgerConfig.getMaxPendingRequestsNum();
     }
 
+    /**
+     * 等待从节点日志复制响应ACk
+     * @param entry
+     * @param isBatchWait
+     * @return
+     */
     public CompletableFuture<AppendEntryResponse> waitAck(DLedgerEntry entry, boolean isBatchWait) {
+        // 更新对等标记
         updatePeerWaterMark(entry.getTerm(), memberState.getSelfId(), entry.getIndex());
         if (memberState.getPeerMap().size() == 1) {
+            // 如果集群中只有一个机器，直接返回成功
             AppendEntryResponse response = new AppendEntryResponse();
             response.setGroup(memberState.getGroup());
             response.setLeaderId(memberState.getSelfId());
@@ -163,6 +192,7 @@ public class DLedgerEntryPusher {
             return AppendFuture.newCompletedFuture(entry.getPos(), response);
         } else {
             checkTermForPendingMap(entry.getTerm(), "waitAck");
+            // 2500毫秒超时的异步回调
             AppendFuture<AppendEntryResponse> future;
             if (isBatchWait) {
                 future = new BatchAppendFuture<>(dLedgerConfig.getMaxWaitAckTimeMs());
@@ -296,6 +326,7 @@ public class DLedgerEntryPusher {
                 long currTerm = memberState.currTerm();
                 checkTermForPendingMap(currTerm, "QuorumAckChecker");
                 checkTermForWaterMark(currTerm, "QuorumAckChecker");
+                // 清除已过期被挂起的请求，向客户端返回错误码 TERM_CHANGED
                 if (pendingAppendResponsesByTerm.size() > 1) {
                     for (Long term : pendingAppendResponsesByTerm.keySet()) {
                         if (term == currTerm) {
@@ -313,6 +344,7 @@ public class DLedgerEntryPusher {
                         pendingAppendResponsesByTerm.remove(term);
                     }
                 }
+
                 if (peerWaterMarksByTerm.size() > 1) {
                     for (Long term : peerWaterMarksByTerm.keySet()) {
                         if (term == currTerm) {
@@ -408,21 +440,40 @@ public class DLedgerEntryPusher {
      *   ^                             |
      *   |---<-----<------<-------<----|
      *
+     *   该线程将由leader激活。该线程会将条目推送到关注者（由 peerId 标识）并将完成的推送索引更新为索引映射。
+     *   应该为每个对等点生成一个线程。推送有 4 种类型：
+     *   APPEND ：将条目附加到跟随者
+     *   COMPARE ：如果领导者发生变化，新领导者应该将其条目与跟随者的条目进行比较
+     *   TRUNCATE ：如果领导者通过索引完成比较，领导者将发送截断请求follower的账本
+     *   COMMIT：通常leader会在APPEND请求中附加commited index，但是如果append请求少且分散，leader会发送纯请求通知follower commit index。
+     *   这些类型之间的常见传输如下： COMPARE ---- TRUNCATE ---- APPEND ---- COMMIT
+     *
      */
     private class EntryDispatcher extends ShutdownAbleThread {
 
+        // 向从节点 发送命令的类型，可选值为COMPARE、TRUNCATE、APPEND、COMMIT
         private AtomicReference<PushEntryRequest.Type> type = new AtomicReference<>(PushEntryRequest.Type.COMPARE);
+        // 上一次发送commit请求的 时间戳。
         private long lastPushCommitTimeMs = -1;
+        // 目标节点ID
         private String peerId;
+        // 已完成COMPARE的日志序号
         private long compareIndex = -1;
+        // 已写入的日志序号
         private long writeIndex = -1;
+        // 允许的最大挂起日志数量
         private int maxPendingSize = 1000;
+        // Leader节点当前的投票轮次
         private long term = -1;
+        // Leader节点ID
         private String leaderId = null;
+        // 上次检测泄漏的时间，所谓泄漏，指的是挂起的日志请求数量超过了maxPendingSize
         private long lastCheckLeakTimeMs = System.currentTimeMillis();
+        // 记录日志的挂起时间，key表示日志的序列 (entryIndex)，value表示挂起时间戳
         private ConcurrentMap<Long, Long> pendingMap = new ConcurrentHashMap<>();
         private ConcurrentMap<Long, Pair<Long, Integer>> batchPendingMap = new ConcurrentHashMap<>();
         private PushEntryRequest batchAppendEntryRequest = new PushEntryRequest();
+        // 配额
         private Quota quota = new Quota(dLedgerConfig.getPeerPushQuota());
 
         public EntryDispatcher(String peerId, Logger logger) {
@@ -493,6 +544,7 @@ public class DLedgerEntryPusher {
                 return;
             }
             checkQuotaAndWait(entry);
+            // 构建append请求包，通过网络异步发送并返回Future， 然后保存该条日志的发送时间戳，用于区分推送请求是否发送超时
             PushEntryRequest request = buildPushRequest(entry, PushEntryRequest.Type.APPEND);
             CompletableFuture<PushEntryResponse> responseFuture = dLedgerRpcService.push(request);
             pendingMap.put(index, System.currentTimeMillis());
@@ -502,12 +554,14 @@ public class DLedgerEntryPusher {
                     DLedgerResponseCode responseCode = DLedgerResponseCode.valueOf(x.getCode());
                     switch (responseCode) {
                         case SUCCESS:
+                            // 成功移除
                             pendingMap.remove(x.getIndex());
                             updatePeerWaterMark(x.getTerm(), peerId, x.getIndex());
                             quorumAckChecker.wakeup();
                             break;
                         case INCONSISTENT_STATE:
                             logger.info("[Push-{}]Get INCONSISTENT_STATE when push index={} term={}", peerId, x.getIndex(), x.getTerm());
+                            // 返回数据已不一致，主从数据比较同步
                             changeState(-1, PushEntryRequest.Type.COMPARE);
                             break;
                         default:
@@ -564,11 +618,13 @@ public class DLedgerEntryPusher {
                 if (type.get() != PushEntryRequest.Type.APPEND) {
                     break;
                 }
+                // writeIndex表示当前已追加到从节点的日志序号
                 if (writeIndex > dLedgerStore.getLedgerEndIndex()) {
                     doCommit();
                     doCheckAppendResponse();
                     break;
                 }
+                // 如果append请求发送不频繁，pending请求超过其队列长度(默 认为1万字节)时，会阻止数据的追加，此时有可能会出现writeIndex 大于leaderEndIndex的情况，需要单独发送commit请求
                 if (pendingMap.size() >= maxPendingSize || (DLedgerUtils.elapsed(lastCheckLeakTimeMs) > 1000)) {
                     long peerWaterMark = getPeerWaterMark(term, peerId);
                     for (Long index : pendingMap.keySet()) {
@@ -578,6 +634,7 @@ public class DLedgerEntryPusher {
                     }
                     lastCheckLeakTimeMs = System.currentTimeMillis();
                 }
+                // 挂起的请求大于maxPendingSize，并且下一条日志的推送请求已经超时，重新发起推送请求
                 if (pendingMap.size() >= maxPendingSize) {
                     doCheckAppendResponse();
                     break;
@@ -694,6 +751,10 @@ public class DLedgerEntryPusher {
             logger.info("[Push-{}]Change state from {} to {} at {}", peerId, type.get(), target, index);
             switch (target) {
                 case APPEND:
+                    /**
+                     * 日志转发器即将进入APPEND状态，该状态下主节点将 向从节点转发日志，重置compareIndex指针，更新当前节点已追加日志序号为index，
+                     * 并唤醒QuorumAckChecker线程，以便对append响应结 果进行仲裁。最后更新待追加日志序号
+                     */
                     compareIndex = -1;
                     updatePeerWaterMark(term, peerId, index);
                     quorumAckChecker.wakeup();
@@ -703,6 +764,9 @@ public class DLedgerEntryPusher {
                     }
                     break;
                 case COMPARE:
+                    /**
+                     * 日志转发器即将进入COMPARE状态，该状态下先重置 compareIndex为-1，然后清除已挂起的日志转发请求，与从节点进行 协商，以确保主从节点数据一致
+                     */
                     if (this.type.compareAndSet(PushEntryRequest.Type.APPEND, PushEntryRequest.Type.COMPARE)) {
                         compareIndex = -1;
                         if (dLedgerConfig.isEnableBatchPush()) {
@@ -713,6 +777,9 @@ public class DLedgerEntryPusher {
                     }
                     break;
                 case TRUNCATE:
+                    /**
+                     * 日志转发器即将进入TRUNCATE状态，该状态下先重 置compareIndex为-1，然后向从节点发起truncate请求，清除从节点未提交且在主节点上不存在的数据，确保主从节点数据一致
+                     */
                     compareIndex = -1;
                     break;
                 default:
@@ -808,9 +875,11 @@ public class DLedgerEntryPusher {
             }
         }
 
+        // ShutdownAbleThread，其 run()方法会循环执行doWork()方法
         @Override
         public void doWork() {
             try {
+                // 检查当前节点状态，根据运行状态改变日志转发器的状态，从而驱动转发器是发送append 请求还是发送compare请求
                 if (!checkAndFreshState()) {
                     waitForRunning(1);
                     return;
@@ -823,6 +892,7 @@ public class DLedgerEntryPusher {
                         doAppend();
                     }
                 } else {
+                    // COMPARE 比较主从的数据差异，保证数据一致
                     doCompare();
                 }
                 waitForRunning(1);
@@ -837,6 +907,7 @@ public class DLedgerEntryPusher {
     /**
      * This thread will be activated by the follower.
      * Accept the push request and order it by the index, then append to ledger store one by one.
+     * 该线程将由follower激活。接受推送请求并按索引排序，然后一一追加到账本存储。
      *
      */
     private class EntryHandler extends ShutdownAbleThread {

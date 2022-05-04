@@ -21,6 +21,9 @@ import com.beust.jcommander.JCommander;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 基于raft算法的rocketMQ高可用解决实现
+ */
 public class DLedger {
 
     private static Logger logger = LoggerFactory.getLogger(DLedger.class);

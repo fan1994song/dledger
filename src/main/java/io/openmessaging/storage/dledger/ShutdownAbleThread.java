@@ -82,6 +82,7 @@ public abstract class ShutdownAbleThread extends Thread {
 
     @Override
     public void run() {
+        // 若是运行中
         while (running.get()) {
             try {
                 doWork();

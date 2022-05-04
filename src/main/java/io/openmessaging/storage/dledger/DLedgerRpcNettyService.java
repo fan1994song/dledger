@@ -139,6 +139,7 @@ public class DLedgerRpcNettyService extends DLedgerRpcService {
             try {
                 RemotingCommand wrapperRequest = RemotingCommand.createRequestCommand(DLedgerRequestCode.HEART_BEAT.getCode(), null);
                 wrapperRequest.setBody(JSON.toJSONBytes(request));
+                // 这里会自行将ID转换为目的addr。无需过问
                 remotingClient.invokeAsync(getPeerAddr(request), wrapperRequest, 3000, responseFuture -> {
                     RemotingCommand responseCommand = responseFuture.getResponseCommand();
                     if (responseCommand != null) {

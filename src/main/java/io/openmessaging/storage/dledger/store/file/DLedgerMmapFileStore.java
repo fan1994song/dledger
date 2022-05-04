@@ -39,6 +39,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 基于文件内存映射机制的存储实现：defaultMessageStore
+ */
 public class DLedgerMmapFileStore extends DLedgerStore {
 
     public static final String CHECK_POINT_FILE = "checkpoint";
@@ -50,24 +53,40 @@ public class DLedgerMmapFileStore extends DLedgerStore {
 
     private static Logger logger = LoggerFactory.getLogger(DLedgerMmapFileStore.class);
     public List<AppendHook> appendHooks = new ArrayList<>();
+    // 日志的起始序号
     private long ledgerBeginIndex = -1;
+    // 下一条日志下标
     private long ledgerEndIndex = -1;
+    // 已提交的日志序号
     private long committedIndex = -1;
     private long committedPos = -1;
+    // 当前最大的投票轮次
     private long ledgerEndTerm;
+    // DLedger的配置信息
     private DLedgerConfig dLedgerConfig;
+    // 状态机信息
     private MemberState memberState;
+    // 日志文件(数据文件)的内存映射队列
     private MmapFileList dataFileList;
+    // 索引文件的内存映射文件集合
     private MmapFileList indexFileList;
+    // 本地线程变量， 用来缓存索引ByteBuffer
     private ThreadLocal<ByteBuffer> localEntryBuffer;
+    // 本地线程变量， 用来缓存数据索引ByteBuffer
     private ThreadLocal<ByteBuffer> localIndexBuffer;
+    // 数据文件刷盘线程
     private FlushDataService flushDataService;
+    // 清除过期日志文件线程
     private CleanSpaceService cleanSpaceService;
+    // 磁盘是否已满
     private volatile boolean isDiskFull = false;
 
+    // 上一次检查点(时间戳)
     private long lastCheckPointTimeMs = System.currentTimeMillis();
 
+    // 是否已经加载
     private AtomicBoolean hasLoaded = new AtomicBoolean(false);
+    // 是否已恢复
     private AtomicBoolean hasRecovered = new AtomicBoolean(false);
 
     private volatile Set<String> fullStorePaths = Collections.emptySet();
@@ -332,38 +351,50 @@ public class DLedgerMmapFileStore extends DLedgerStore {
 
     }
 
+    // Raft会为Leader节点收到的每一条数据在服务端维护一个递增的日志序号，即为每一条数据生成了一个唯一的标记
     @Override
     public DLedgerEntry appendAsLeader(DLedgerEntry entry) {
+        // 校验是否是leader、磁盘是否已满(判断依据是DLedger的根目录或数据 文件目录的使用率是否超过了允许使用的最大值，默认值为85%)
         PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER);
         PreConditions.check(!isDiskFull, DLedgerResponseCode.DISK_FULL);
+        // 本地线程变量获取一个数据Buffer与索引Buffer
         ByteBuffer dataBuffer = localEntryBuffer.get();
         ByteBuffer indexBuffer = localIndexBuffer.get();
         DLedgerEntryCoder.encode(entry, dataBuffer);
         int entrySize = dataBuffer.remaining();
+        // 锁定状态机
         synchronized (memberState) {
+            // 再次校验是否是leader
             PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER, null);
             PreConditions.check(memberState.getTransferee() == null, DLedgerResponseCode.LEADER_TRANSFERRING, null);
+            // 设置日志条目序号、当前投票轮次
             long nextIndex = ledgerEndIndex + 1;
             entry.setIndex(nextIndex);
             entry.setTerm(memberState.currTerm());
             entry.setMagic(CURRENT_MAGIC);
             DLedgerEntryCoder.setIndexTerm(dataBuffer, nextIndex, memberState.currTerm(), CURRENT_MAGIC);
+            // 计算消息的起始物理偏移量,将该偏移量写入日志的byteBuffer
             long prePos = dataFileList.preAppend(dataBuffer.remaining());
             entry.setPos(prePos);
             PreConditions.check(prePos != -1, DLedgerResponseCode.DISK_ERROR, null);
             DLedgerEntryCoder.setPos(dataBuffer, prePos);
+            // 日志追加的钩子函数
             for (AppendHook writeHook : appendHooks) {
                 writeHook.doHook(entry, dataBuffer.slice(), DLedgerEntry.BODY_OFFSET);
             }
+            // dataFileList的append方法将日志先追加到pageCache中
             long dataPos = dataFileList.append(dataBuffer.array(), 0, dataBuffer.remaining());
+            // 校验追加结果
             PreConditions.check(dataPos != -1, DLedgerResponseCode.DISK_ERROR, null);
             PreConditions.check(dataPos == prePos, DLedgerResponseCode.DISK_ERROR, null);
             DLedgerEntryCoder.encodeIndex(dataPos, entrySize, CURRENT_MAGIC, nextIndex, memberState.currTerm(), indexBuffer);
+            // 构建索引条目并追加到PageCache中
             long indexPos = indexFileList.append(indexBuffer.array(), 0, indexBuffer.remaining(), false);
             PreConditions.check(indexPos == entry.getIndex() * INDEX_UNIT_SIZE, DLedgerResponseCode.DISK_ERROR, null);
             if (logger.isDebugEnabled()) {
                 logger.info("[{}] Append as Leader {} {}", memberState.getSelfId(), entry.getIndex(), entry.getBody().length);
             }
+            // 一条消息被追加后，日志序号增加1，并更新当前节点状态机的leaderEndIndex与当前投票轮次
             ledgerEndIndex++;
             ledgerEndTerm = memberState.currTerm();
             if (ledgerBeginIndex == -1) {

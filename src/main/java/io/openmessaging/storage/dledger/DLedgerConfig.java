@@ -20,6 +20,9 @@ import com.beust.jcommander.Parameter;
 import io.openmessaging.storage.dledger.store.file.DLedgerMmapFileStore;
 import java.io.File;
 
+/**
+ * 主从切换模块相关的配置信息
+ */
 public class DLedgerConfig {
 
     public static final String MEMORY = "MEMORY";
@@ -56,6 +59,7 @@ public class DLedgerConfig {
 
     private int maxPushTimeOutMs = 1000;
 
+    // 是否开启leader选举
     private boolean enableLeaderElector = true;
 
     private int heartBeatTimeIntervalMs = 2000;

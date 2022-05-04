@@ -20,6 +20,7 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * Both the RaftLogServer(inbound) and RaftRpcService (outbound) should implement this protocol
+ * DLedger服务端协议处理器
  */
 public interface DLedgerProtocolHandler extends DLedgerClientProtocolHandler {
 

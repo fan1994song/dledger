@@ -19,26 +19,49 @@ package io.openmessaging.storage.dledger.store;
 import io.openmessaging.storage.dledger.MemberState;
 import io.openmessaging.storage.dledger.entry.DLedgerEntry;
 
+/**
+ * 存储抽象类
+ */
 public abstract class DLedgerStore {
 
     public MemberState getMemberState() {
         return null;
     }
 
+    /**
+     * 向主节点追加日志
+     * @param entry
+     * @return
+     */
     public abstract DLedgerEntry appendAsLeader(DLedgerEntry entry);
 
+    /**
+     * 向从节点广播日志
+     */
     public abstract DLedgerEntry appendAsFollower(DLedgerEntry entry, long leaderTerm, String leaderId);
 
     public abstract DLedgerEntry get(Long index);
 
+    /**
+     * 获取已提交的日志序号
+     * @return
+     */
     public abstract long getCommittedIndex();
 
     public void updateCommittedIndex(long term, long committedIndex) {
 
     }
 
+    /**
+     * 获取leader节点当前最大的投票轮次
+     * @return
+     */
     public abstract long getLedgerEndTerm();
 
+    /**
+     * 获取leader的节点下一条日志写入的日志序号
+     * @return
+     */
     public abstract long getLedgerEndIndex();
 
     public abstract long getLedgerBeginIndex();
